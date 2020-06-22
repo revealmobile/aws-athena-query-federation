@@ -201,7 +201,7 @@ public class ExampleMetadataHandlerTest
         try {
 
             req = new GetTableLayoutRequest(fakeIdentity(), "queryId", "default",
-                    new TableName("schema1", "table1"),
+                    new TableName("primary", "event"),
                     new Constraints(constraintsMap),
                     tableSchema,
                     partitionCols);

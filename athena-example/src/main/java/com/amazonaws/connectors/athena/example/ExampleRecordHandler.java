@@ -22,38 +22,69 @@ package com.amazonaws.connectors.athena.example;
 import com.amazonaws.athena.connector.lambda.QueryStatusChecker;
 import com.amazonaws.athena.connector.lambda.data.Block;
 import com.amazonaws.athena.connector.lambda.data.BlockSpiller;
-import com.amazonaws.athena.connector.lambda.data.BlockUtils;
-import com.amazonaws.athena.connector.lambda.data.FieldResolver;
 import com.amazonaws.athena.connector.lambda.data.writers.GeneratedRowWriter;
-import com.amazonaws.athena.connector.lambda.data.writers.extractors.Extractor;
+import com.amazonaws.athena.connector.lambda.data.writers.extractors.Float8Extractor;
 import com.amazonaws.athena.connector.lambda.data.writers.extractors.IntExtractor;
 import com.amazonaws.athena.connector.lambda.data.writers.extractors.VarCharExtractor;
-import com.amazonaws.athena.connector.lambda.data.writers.fieldwriters.FieldWriter;
 import com.amazonaws.athena.connector.lambda.data.writers.holders.NullableVarCharHolder;
 import com.amazonaws.athena.connector.lambda.domain.Split;
-import com.amazonaws.athena.connector.lambda.domain.predicate.ConstraintProjector;
+import com.amazonaws.athena.connector.lambda.domain.predicate.Range;
+import com.amazonaws.athena.connector.lambda.domain.predicate.ValueSet;
 import com.amazonaws.athena.connector.lambda.handlers.RecordHandler;
 import com.amazonaws.athena.connector.lambda.records.ReadRecordsRequest;
 import com.amazonaws.services.athena.AmazonAthena;
 import com.amazonaws.services.athena.AmazonAthenaClientBuilder;
 import com.amazonaws.services.s3.AmazonS3;
 import com.amazonaws.services.s3.AmazonS3ClientBuilder;
-import com.amazonaws.services.s3.model.S3Object;
+import com.amazonaws.services.s3.model.*;
 import com.amazonaws.services.secretsmanager.AWSSecretsManager;
 import com.amazonaws.services.secretsmanager.AWSSecretsManagerClientBuilder;
 import org.apache.arrow.util.VisibleForTesting;
-import org.apache.arrow.vector.FieldVector;
+import org.apache.arrow.vector.holders.NullableFloat8Holder;
 import org.apache.arrow.vector.holders.NullableIntHolder;
+
+import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.fs.Path;
+import org.apache.parquet.ParquetReadOptions;
+import org.apache.parquet.column.page.PageReadStore;
+import org.apache.parquet.filter2.compat.FilterCompat;
+import org.apache.parquet.filter2.predicate.FilterApi;
+import org.apache.parquet.filter2.predicate.FilterPredicate;
+import org.apache.parquet.filter2.predicate.Operators.BinaryColumn;
+import org.apache.parquet.format.converter.ParquetMetadataConverter;
+import org.apache.parquet.example.data.simple.SimpleGroup;
+import org.apache.parquet.example.data.simple.convert.GroupRecordConverter;
+import org.apache.parquet.hadoop.ParquetFileReader;
+import org.apache.parquet.hadoop.util.HadoopInputFile;
+import org.apache.parquet.io.ColumnIOFactory;
+import org.apache.parquet.io.InputFile;
+import org.apache.parquet.io.MessageColumnIO;
+import org.apache.parquet.io.RecordReader;
+import org.apache.parquet.io.api.Binary;
+import org.apache.parquet.schema.MessageType;
+
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.io.BufferedReader;
+import java.io.BufferedInputStream;
+import java.io.DataInputStream;
 import java.io.IOException;
-import java.io.InputStreamReader;
+import java.io.InputStream;
+import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
+import java.util.concurrent.Callable;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.zip.GZIPInputStream;
 
-import static java.lang.String.format;
+import com.revealmobile.geohashtrie.GeohashTrie;
+import com.revealmobile.geohashtrie.GeohashUtils;
+
+import com.github.davidmoten.geo.GeoHash;
 
 /**
  * This class is part of an tutorial that will walk you through how to build a connector for your
@@ -71,12 +102,6 @@ public class ExampleRecordHandler
 {
     private static final Logger logger = LoggerFactory.getLogger(ExampleRecordHandler.class);
 
-    /**
-     * used to aid in debugging. Athena will use this name in conjunction with your catalog id
-     * to correlate relevant query errors.
-     */
-    private static final String SOURCE_TYPE = "example";
-
     private AmazonS3 amazonS3;
 
     public ExampleRecordHandler()
@@ -87,8 +112,16 @@ public class ExampleRecordHandler
     @VisibleForTesting
     protected ExampleRecordHandler(AmazonS3 amazonS3, AWSSecretsManager secretsManager, AmazonAthena amazonAthena)
     {
-        super(amazonS3, secretsManager, amazonAthena, SOURCE_TYPE);
+        super(amazonS3, secretsManager, amazonAthena, ExampleMetadataHandler.SOURCE_TYPE);
         this.amazonS3 = amazonS3;
+    }
+
+    static InputStream openStream(final String src, final InputStream inputStream) throws IOException {
+        if (src.endsWith(".gz")) {
+            return new GZIPInputStream(inputStream, 65535);
+        } else {
+            return new BufferedInputStream(inputStream, 65535);
+        }
     }
 
     /**
@@ -112,64 +145,87 @@ public class ExampleRecordHandler
     {
         logger.info("readWithConstraint: enter - " + recordsRequest.getSplit());
 
-        Split split = recordsRequest.getSplit();
-        int splitYear = 0;
-        int splitMonth = 0;
-        int splitDay = 0;
+        final ValueSet triePath = recordsRequest.getConstraints().getSummary().get("geohash_trie");
+        final List<GeohashRange> ranges = new ArrayList<>();
+        if (triePath == null) {
+            logger.warn("no geohash range or Geohash Trie path set via (geohash_trie = 's3://...'). Aborting");
 
-        /**
-         * TODO: Extract information about what we need to read from the split. If you are following the tutorial
-         *  this is basically the partition column values for year, month, day.
-         *
-         splitYear = split.getPropertyAsInt("year");
-         splitMonth = split.getPropertyAsInt("month");
-         splitDay = split.getPropertyAsInt("day");
-         *
-         */
-
-        String dataBucket = null;
-        /**
-         * TODO: Get the data bucket from the env variable set by athena-example.yaml
-         *
-         dataBucket = System.getenv("data_bucket");
-         *
-         */
-
-        String dataKey = format("%s/%s/%s/sample_data.csv", splitYear, splitMonth, splitDay);
-
-        BufferedReader s3Reader = openS3File(dataBucket, dataKey);
-        if (s3Reader == null) {
-            //There is no data to read for this split.
             return;
         }
 
+        GeohashTrie trie = null;
+        if (triePath.isSingleValue()) {
+            if (triePath.getSingleValue().toString().startsWith("s3://")) {
+                try {
+                    final java.net.URI objectURI = new java.net.URI(triePath.getSingleValue().toString());
+                    try (S3Object obj = amazonS3.getObject(objectURI.getHost(), objectURI.getPath().substring(1));
+                        DataInputStream dataInput = new DataInputStream(openStream(obj.getKey(), obj.getObjectContent()))) {
+                        GeohashTrie.readHeader(dataInput);
+                        trie = GeohashTrie.read(dataInput);
+                        for (long[] bound : trie.getBoundsAt(2)) {
+                            ranges.add(new GeohashRange(GeohashUtils.fromLongToString(bound[0]), GeohashRange.rightPad(GeohashUtils.fromLongToString(bound[1]), "z", 10)));
+                        }
+                    }
+                } catch (Exception ex) {
+                    throw new RuntimeException(ex);
+                }
+            } else if (triePath.getSingleValue().toString().toUpperCase().startsWith("POLYGON(")) {
+                trie = ExampleMetadataHandler.convertWKT(triePath.getSingleValue().toString().toUpperCase());
+                for (long[] bound : trie.getBoundsAt(2)) {
+                    ranges.add(new GeohashRange(GeohashUtils.fromLongToString(bound[0]), GeohashRange.rightPad(GeohashUtils.fromLongToString(bound[1]), "z", 10)));
+                }
+            }
+        } else {
+            for (Range r : triePath.getRanges().getOrderedRanges()) {
+                ranges.add(new GeohashRange(r.getLow().getValue().toString(), GeohashRange.rightPad(r.getHigh().getValue().toString(), "z", 10)));
+            }
+        }
+
+        Split split = recordsRequest.getSplit();
+
         GeneratedRowWriter.RowWriterBuilder builder = GeneratedRowWriter.newBuilder(recordsRequest.getConstraints());
 
-        /**
-         * TODO: Add extractors for each field to our RowWRiterBuilder, the RowWriterBuilder will then 'generate'
-         * optomized code for converting our data to Apache Arrow, automatically minimizing memory overhead, code
-         * branches, etc... Later in the code when we call RowWriter for each line in our S3 file
-         *
-         builder.withExtractor("year", (IntExtractor) (Object context, NullableIntHolder value) -> {
-             value.isSet = 1;
-             value.value = Integer.parseInt(((String[]) context)[0]);
-         });
+        builder.withExtractor("d", (VarCharExtractor) (Object context, NullableVarCharHolder value) -> {
+            value.isSet = 1;
+            value.value = split.getProperty("d");
+        });
 
-         builder.withExtractor("month", (IntExtractor) (Object context, NullableIntHolder value) -> {
-             value.isSet = 1;
-             value.value = Integer.parseInt(((String[]) context)[1]);
-         });
+        builder.withExtractor("type_id", (IntExtractor) (Object context, NullableIntHolder value) -> {
+            value.isSet = 1;
+            value.value = split.getPropertyAsInt("type_id");
+        });
 
-         builder.withExtractor("day", (IntExtractor) (Object context, NullableIntHolder value) -> {
-             value.isSet = 1;
-             value.value = Integer.parseInt(((String[]) context)[2]);
-         });
+        builder.withExtractor("advertiser_id", (VarCharExtractor) (Object context, NullableVarCharHolder value) -> {
+            value.isSet = 1;
+            value.value = ((SimpleGroup) context).getString("advertiser_id", 0);
+        });
 
-         builder.withExtractor("encrypted_payload", (VarCharExtractor) (Object context, NullableVarCharHolder value) -> {
-             value.isSet = 1;
-             value.value = ((String[]) context)[6];
-         });
-         */
+        builder.withExtractor("os", (IntExtractor) (Object context, NullableIntHolder value) -> {
+            value.isSet = 1;
+            value.value = ((SimpleGroup) context).getInteger("os", 0);
+        });
+
+        builder.withExtractor("lat", (Float8Extractor) (Object context, NullableFloat8Holder value) -> {
+            value.isSet = 1;
+            value.value = GeoHash.decodeHash(((SimpleGroup) context).getString("geohash", 0)).getLat();
+        });
+
+        builder.withExtractor("lon", (Float8Extractor) (Object context, NullableFloat8Holder value) -> {
+            value.isSet = 1;
+            value.value = GeoHash.decodeHash(((SimpleGroup) context).getString("geohash", 0)).getLon();
+        });
+
+        builder.withExtractor("geohash", (VarCharExtractor) (Object context, NullableVarCharHolder value) -> {
+            value.isSet = 1;
+            value.value = ((SimpleGroup) context).getString("geohash", 0);
+        });
+
+        //unless we find out that we can mark a constraint as satisfied by partition pruning
+        //we need to trick the final query engine by assigning an input constraint (or part of one) as an output column
+        builder.withExtractor("geohash_trie", (VarCharExtractor) (Object context, NullableVarCharHolder value) -> {
+            value.isSet = 1;
+            value.value = triePath.isSingleValue() ? triePath.getSingleValue().toString() : triePath.getRanges().getOrderedRanges().get(0).getLow().getValue().toString();
+        });
 
         /**
          * TODO: The account_id field is a sensitive field, so we'd like to mask it to the last 4 before
@@ -201,32 +257,113 @@ public class ExampleRecordHandler
         //Used some basic code-gen to optimize how we generate response data.
         GeneratedRowWriter rowWriter = builder.build();
 
-        //We read the transaction data line by line from our S3 object.
-        String line;
-        while ((line = s3Reader.readLine()) != null) {
-            logger.info("readWithConstraint: processing line " + line);
+        try {
+            final Map<String, SimpleGroup> uniques = readFiles(ranges, trie, split.getProperty("paths").split(","));
 
-            //The sample_data.csv file is structured as year,month,day,account_id,transaction.id,transaction.complete
-            String[] lineParts = line.split(",");
+            logger.debug("writing " + uniques.size() + " rows");
+            //TODO rollup distinct values
 
-            //We use the provided BlockSpiller to write our row data into the response. This utility is provided by
-            //the Amazon Athena Query Federation SDK and automatically handles breaking the data into reasonably sized
-            //chunks, encrypting it, and spilling to S3 if we've enabled these features.
-            spiller.writeRows((Block block, int rowNum) -> rowWriter.writeRow(block, rowNum, lineParts) ? 1 : 0);
+            //We read the transaction data line by line from our S3 object.
+            for (SimpleGroup values : uniques.values()) {
+                //We use the provided BlockSpiller to write our row data into the response. This utility is provided by
+                //the Amazon Athena Query Federation SDK and automatically handles breaking the data into reasonably sized
+                //chunks, encrypting it, and spilling to S3 if we've enabled these features.
+                spiller.writeRows((Block block, int rowNum) -> rowWriter.writeRow(block, rowNum, values) ? 1 : 0);
+            }
+        } catch (Exception ex) {
+            throw new RuntimeException(ex);
         }
     }
 
-    /**
-     * Helper function for checking the existence of and opening S3 Objects for read.
-     */
-    private BufferedReader openS3File(String bucket, String key)
-    {
-        logger.info("openS3File: opening file " + bucket + ":" + key);
-        if (amazonS3.doesObjectExist(bucket, key)) {
-            S3Object obj = amazonS3.getObject(bucket, key);
-            logger.info("openS3File: opened file " + bucket + ":" + key);
-            return new BufferedReader(new InputStreamReader(obj.getObjectContent()));
+    private static final ExecutorService executor = Executors.newFixedThreadPool(Integer.parseInt(System.getProperty("concurrent.readers", "5")));
+
+    public static Map<String, SimpleGroup> readFiles(final Iterable<GeohashRange> ranges, final GeohashTrie trie, final String... paths) throws Exception {
+        // TODO uniques after stream join
+        final HashMap<String, SimpleGroup> uniques = new HashMap<>();
+
+        final BinaryColumn ghCol = FilterApi.binaryColumn("geohash");
+        FilterPredicate fp = null;
+        for (GeohashRange range : ranges) {
+            final FilterPredicate subfilter = FilterApi.and(FilterApi.gtEq(ghCol, Binary.fromString(range.getLower())), FilterApi.ltEq(ghCol, Binary.fromString(range.getUpper())));
+            fp = fp == null ? subfilter : FilterApi.or(fp, subfilter);
         }
-        return null;
+        final FilterCompat.Filter filter = FilterCompat.get(fp);
+
+        final ParquetReadOptions readOptions = ParquetReadOptions.builder().withMetadataFilter(ParquetMetadataConverter.NO_FILTER).build();
+
+        final int advertiserIdFieldIdx = 0;
+        final int osFieldIdx = 1;
+        final int geohashFieldIdx = 2;
+
+        final AtomicInteger recordCount = new AtomicInteger();
+        final ArrayList<Callable<Void>> tasks = new ArrayList<>(paths.length);
+
+        final Configuration conf = new Configuration();
+        for (String path : paths) {
+            final Path parquetFilePath = new Path(path.replaceAll("s3://","s3a://"));
+            tasks.add(new Callable<Void>() {
+                @Override
+                public Void call() throws Exception {
+                    final InputFile in = HadoopInputFile.fromPath(parquetFilePath, conf);
+
+                    final ParquetFileReader r = ParquetFileReader.open(in, readOptions);
+
+                    final MessageType fileSchema = r.getFileMetaData().getSchema();
+                    final MessageType projection = new MessageType(fileSchema.getName(), Arrays.asList(
+                            fileSchema.getFields().get(fileSchema.getFieldIndex("advertiser_id")),
+                            fileSchema.getFields().get(fileSchema.getFieldIndex("os")),
+                            fileSchema.getFields().get(fileSchema.getFieldIndex("geohash"))
+                    ));
+                    PageReadStore pageReadStore = r.readNextRowGroup();
+
+                    while (pageReadStore != null) {
+                        MessageColumnIO columnIO = new ColumnIOFactory().getColumnIO(projection, fileSchema);
+                        RecordReader recordReader = columnIO.getRecordReader(pageReadStore, new GroupRecordConverter(projection), filter);
+
+                        for (int i = 0; i < pageReadStore.getRowCount(); i++) {
+                            SimpleGroup record = (SimpleGroup) recordReader.read();
+                            if (!recordReader.shouldSkipCurrentRecord()) {
+                                final String uniqueKey = record.getString(advertiserIdFieldIdx, 0) + record.getInteger(osFieldIdx, 0);
+                                synchronized (uniques) {
+                                    if (!uniques.containsKey(uniqueKey)) {
+                                        if (trie == null || trie.contains(GeohashUtils.fromStringToLong(record.getString(geohashFieldIdx, 0)))) {
+                                            uniques.put(uniqueKey, record);
+                                        }
+                                    }
+                                }
+                            }
+                            if (recordCount.incrementAndGet() % 10000 == 0) {
+                                logger.debug("Processed " + recordCount.get() + " records, resulting in " + uniques.size() + " distinct values");
+                            }
+                        }
+                        pageReadStore = r.readNextRowGroup();
+                    }
+
+                    r.close();
+                    return null;
+                }
+            });
+        }
+
+        executor.invokeAll(tasks);
+
+        return uniques;
+    }
+
+    public static void main(String[] args) {
+        if (args.length >= 2) {
+            ArrayList<GeohashRange> ranges = new ArrayList<>();
+            for (int i=1; i<args.length; i++) {
+                ranges.add(GeohashRange.parse(args[i]));
+            }
+            try {
+                final Map<String, SimpleGroup> uniques = readFiles(ranges, null, args[0]);
+                for (Map.Entry e : uniques.entrySet()) {
+                    System.out.println(e.getKey() + ": " + e.getValue());
+                }
+            } catch (Exception ex) {
+                ex.printStackTrace();
+            }
+        }
     }
 }

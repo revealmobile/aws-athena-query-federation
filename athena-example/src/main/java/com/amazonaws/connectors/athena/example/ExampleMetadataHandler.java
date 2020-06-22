@@ -26,6 +26,8 @@ import com.amazonaws.athena.connector.lambda.data.BlockWriter;
 import com.amazonaws.athena.connector.lambda.data.SchemaBuilder;
 import com.amazonaws.athena.connector.lambda.domain.Split;
 import com.amazonaws.athena.connector.lambda.domain.TableName;
+import com.amazonaws.athena.connector.lambda.domain.predicate.Range;
+import com.amazonaws.athena.connector.lambda.domain.predicate.ValueSet;
 import com.amazonaws.athena.connector.lambda.handlers.MetadataHandler;
 import com.amazonaws.athena.connector.lambda.metadata.GetSplitsRequest;
 import com.amazonaws.athena.connector.lambda.metadata.GetSplitsResponse;
@@ -38,7 +40,11 @@ import com.amazonaws.athena.connector.lambda.metadata.ListTablesRequest;
 import com.amazonaws.athena.connector.lambda.metadata.ListTablesResponse;
 import com.amazonaws.athena.connector.lambda.security.EncryptionKeyFactory;
 import com.amazonaws.services.athena.AmazonAthena;
+import com.amazonaws.services.s3.AmazonS3;
+import com.amazonaws.services.s3.AmazonS3ClientBuilder;
+import com.amazonaws.services.s3.model.*;
 import com.amazonaws.services.secretsmanager.AWSSecretsManager;
+
 import org.apache.arrow.util.VisibleForTesting;
 import org.apache.arrow.vector.complex.reader.FieldReader;
 //DO NOT REMOVE - this will not be _unused_ when customers go through the tutorial and uncomment
@@ -47,10 +53,29 @@ import org.apache.arrow.vector.types.Types;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.io.DataInputStream;
+import static java.nio.charset.StandardCharsets.UTF_8;
+
+import java.text.SimpleDateFormat;
+
 import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Calendar;
+import java.util.Collections;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
+
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+
+import com.revealmobile.geohashtrie.GeohashTrie;
+import com.revealmobile.geohashtrie.GeohashUtils;
+import com.revealmobile.geohashtrie.ShapeCoverage;
+
+import com.esri.core.geometry.Envelope;
+import com.esri.core.geometry.Geometry;
+import com.esri.core.geometry.ogc.OGCGeometry;
 
 /**
  * This class is part of an tutorial that will walk you through how to build a connector for your
@@ -69,15 +94,29 @@ public class ExampleMetadataHandler
 {
     private static final Logger logger = LoggerFactory.getLogger(ExampleMetadataHandler.class);
 
+    private static final String SCHEMA = "primary";
+
+    private static final String EVENT_TABLE = "event";
+
     /**
      * used to aid in debugging. Athena will use this name in conjunction with your catalog id
      * to correlate relevant query errors.
      */
-    private static final String SOURCE_TYPE = "example";
+    static final String SOURCE_TYPE = "RevealGeohashTrie";
+
+    private static final int PREFERRED_CONCURRENCY = 10;
+
+    public static final String BASE32_ALPHABET = "0123456789bcdefghjkmnpqrstuvwxyz";
+
+    private static final Pattern PATH_PATTERN = Pattern.compile(".*geohash-range_(["+BASE32_ALPHABET+"]+)-(["+BASE32_ALPHABET+"]+).*");
+
+    private final AmazonS3 amazonS3;
 
     public ExampleMetadataHandler()
     {
         super(SOURCE_TYPE);
+
+        amazonS3 = AmazonS3ClientBuilder.defaultClient();
     }
 
     @VisibleForTesting
@@ -88,6 +127,8 @@ public class ExampleMetadataHandler
             String spillPrefix)
     {
         super(keyFactory, awsSecretsManager, athena, SOURCE_TYPE, spillBucket, spillPrefix);
+
+        amazonS3 = AmazonS3ClientBuilder.defaultClient();
     }
 
     /**
@@ -103,16 +144,7 @@ public class ExampleMetadataHandler
     {
         logger.info("doListSchemaNames: enter - " + request);
 
-        Set<String> schemas = new HashSet<>();
-
-        /**
-         * TODO: Add schemas, example below
-         *
-         schemas.add("schema1");
-         *
-         */
-
-        return new ListSchemasResponse(request.getCatalogName(), schemas);
+        return new ListSchemasResponse(request.getCatalogName(), Collections.singleton(SCHEMA));
     }
 
     /**
@@ -128,16 +160,7 @@ public class ExampleMetadataHandler
     {
         logger.info("doListTables: enter - " + request);
 
-        List<TableName> tables = new ArrayList<>();
-
-        /**
-         * TODO: Add tables for the requested schema, example below
-         *
-         tables.add(new TableName(request.getSchemaName(), "table1"));
-         *
-         */
-
-        return new ListTablesResponse(request.getCatalogName(), tables);
+        return new ListTablesResponse(request.getCatalogName(), Arrays.asList(new TableName(request.getSchemaName(), EVENT_TABLE)));
     }
 
     /**
@@ -158,42 +181,32 @@ public class ExampleMetadataHandler
 
         Set<String> partitionColNames = new HashSet<>();
 
-        /**
-         * TODO: Add partitions columns, example below.
-         *
-         partitionColNames.add("year");
-         partitionColNames.add("month");
-         partitionColNames.add("day");
-         *
-         */
+        partitionColNames.add("d");
+        partitionColNames.add("type_id");
 
         SchemaBuilder tableSchemaBuilder = SchemaBuilder.newBuilder();
 
-        /**
-         * TODO: Generate a schema for the requested table.
-         *
-         tableSchemaBuilder.addIntField("year")
-         .addIntField("month")
-         .addIntField("day")
-         .addStringField("account_id")
-         .addStringField("encrypted_payload")
-         .addStructField("transaction")
-         .addChildField("transaction", "id", Types.MinorType.INT.getType())
-         .addChildField("transaction", "completed", Types.MinorType.BIT.getType())
-         //Metadata who's name matches a column name
-         //is interpreted as the description of that
-         //column when you run "show tables" queries.
-         .addMetadata("year", "The year that the payment took place in.")
-         .addMetadata("month", "The month that the payment took place in.")
-         .addMetadata("day", "The day that the payment took place in.")
-         .addMetadata("account_id", "The account_id used for this payment.")
-         .addMetadata("encrypted_payload", "A special encrypted payload.")
-         .addMetadata("transaction", "The payment transaction details.")
-         //This metadata field is for our own use, Athena will ignore and pass along fields it doesn't expect.
-         //we will use this later when we implement doGetTableLayout(...)
-         .addMetadata("partitionCols", "year,month,day");
-         *
-         */
+        tableSchemaBuilder
+        .addStringField("d")
+        .addIntField("type_id")
+        .addStringField("advertiser_id")
+        .addIntField("os")
+        .addFloat8Field("lat")
+        .addFloat8Field("lon")
+        .addStringField("geohash")
+        .addStringField("geohash_trie") //special treatment for pruning files
+        //Metadata who's name matches a column name
+        //is interpreted as the description of that
+        //column when you run "show tables" queries.
+        .addMetadata("d", "The date that the event took place in.")
+        .addMetadata("type_id", "The type of event.")
+        .addMetadata("advertiser_id", "The device identifier")
+        .addMetadata("os", "The type of device")
+        .addMetadata("geohash", "The geohash32 representation of the lat,lon.")
+        .addMetadata("geohash_trie", "A special field used for pruning files")
+        //This metadata field is for our own use, Athena will ignore and pass along fields it doesn't expect.
+        //we will use this later when we implement doGetTableLayout(...)
+        .addMetadata("partitionCols", "d,type_id");
 
         return new GetTableResponse(request.getCatalogName(),
                 request.getTableName(),
@@ -215,30 +228,25 @@ public class ExampleMetadataHandler
     public void getPartitions(BlockWriter blockWriter, GetTableLayoutRequest request, QueryStatusChecker queryStatusChecker)
             throws Exception
     {
-        for (int year = 2000; year < 2018; year++) {
-            for (int month = 1; month < 12; month++) {
-                for (int day = 1; day < 31; day++) {
-
-                    final int yearVal = year;
-                    final int monthVal = month;
-                    final int dayVal = day;
-                    /**
-                     * TODO: If the partition represented by this year,month,day offer the values to the block
-                     * and check if they all passed constraints. The Block has been configured to automatically
-                     * apply our partition pruning constraints.
-                     *
-                     blockWriter.writeRows((Block block, int row) -> {
-                     boolean matched = true;
-                     matched &= block.setValue("year", row, yearVal);
-                     matched &= block.setValue("month", row, monthVal);
-                     matched &= block.setValue("day", row, dayVal);
-                     //If all fields matches then we wrote 1 row during this call so we return 1
-                     return matched ? 1 : 0;
-                     });
-                     *
-                     */
-                }
+        final Calendar start = Calendar.getInstance();
+        start.add(Calendar.DATE, -1*start.get(Calendar.DATE));
+        start.add(Calendar.YEAR, -2); //TODO make this configurable?
+        final Calendar end = Calendar.getInstance();
+        final SimpleDateFormat sdf = new SimpleDateFormat("yyyyMMdd");
+        while (!start.after(end)) {
+            final String d = sdf.format(start.getTime());
+            for (int t=1; t<3; t++) {
+                final int type_id = t;
+                //logger.debug("checking partition " + d + ", " + type_id);
+                blockWriter.writeRows((Block block, int row) -> {
+                    boolean matched = true;
+                    matched &= block.setValue("d", row, d);
+                    matched &= block.setValue("type_id", row, type_id);
+                    //If all fields matches then we wrote 1 row during this call so we return 1
+                    return matched ? 1 : 0;
+                });
             }
+            start.add(Calendar.DATE, 1);
         }
     }
 
@@ -262,38 +270,129 @@ public class ExampleMetadataHandler
 
         String catalogName = request.getCatalogName();
         Set<Split> splits = new HashSet<>();
+        //IMPORTANT: the RecordHandler implementation assumes one partition per split
+
+        final ValueSet triePath = request.getConstraints().getSummary().get("geohash_trie");
+        final List<GeohashRange> ranges = new ArrayList<>();
+        if (triePath == null) {
+            logger.warn("no geohash range or Geohash Trie path set via (geohash_trie = 's3://...'). Aborting");
+
+            return new GetSplitsResponse(catalogName, splits);
+        }
+        if (triePath.isSingleValue()) {
+            if (triePath.getSingleValue().toString().startsWith("s3://")) {
+                try {
+                    final java.net.URI objectURI = new java.net.URI(triePath.getSingleValue().toString());
+                    try (S3Object obj = amazonS3.getObject(objectURI.getHost(), objectURI.getPath().substring(1));
+                         DataInputStream dataInput = new DataInputStream(ExampleRecordHandler.openStream(obj.getKey(), obj.getObjectContent()))) {
+                        GeohashTrie.readHeader(dataInput);
+                        final GeohashTrie trie = GeohashTrie.read(dataInput);
+                        for (long[] bound : trie.getBoundsAt(2)) {
+                            ranges.add(new GeohashRange(GeohashUtils.fromLongToString(bound[0]), GeohashRange.rightPad(GeohashUtils.fromLongToString(bound[1]), "z", 10)));
+                        }
+                    }
+                } catch (Exception ex) {
+                    throw new RuntimeException(ex);
+                }
+            } else if (triePath.getSingleValue().toString().toUpperCase().startsWith("POLYGON(")) {
+                final GeohashTrie trie = convertWKT(triePath.getSingleValue().toString().toUpperCase());
+                for (long[] bound : trie.getBoundsAt(2)) {
+                    ranges.add(new GeohashRange(GeohashUtils.fromLongToString(bound[0]), GeohashRange.rightPad(GeohashUtils.fromLongToString(bound[1]), "z", 10)));
+                }
+            }
+            //TODO throw exception or get all ranges from all tries
+        } else {
+            for (Range r : triePath.getRanges().getOrderedRanges()) {
+                ranges.add(new GeohashRange(r.getLow().getValue().toString(), GeohashRange.rightPad(r.getHigh().getValue().toString(), "z", 10)));
+            }
+        }
+
+        for (GeohashRange range : ranges) {
+            //logger.debug(range.getLower() + " - " + range.getUpper());
+        }
 
         Block partitions = request.getPartitions();
 
-        FieldReader day = partitions.getFieldReader("day");
-        FieldReader month = partitions.getFieldReader("month");
-        FieldReader year = partitions.getFieldReader("year");
+        FieldReader d = partitions.getFieldReader("d");
+        FieldReader typeId = partitions.getFieldReader("type_id");
+
+        final SimpleDateFormat sdf = new SimpleDateFormat("yyyyMMdd");
+
+        //goal: more files per split when total partitions is high,
+        //also want at least 2 files in each split to mitigate startup time penalty
+        final int maxSplitSize = Math.min(Math.max(5, partitions.getRowCount()), 10);
+        final List<String> accepted = new ArrayList<>();
+
+        //logger.debug("listing " + partitions.getRowCount() + " partitions");
+
         for (int i = 0; i < partitions.getRowCount(); i++) {
-            //Set the readers to the partition row we area on
-            year.setPosition(i);
-            month.setPosition(i);
-            day.setPosition(i);
+            //Set the readers to the partition row we are on
+            d.setPosition(i);
+            typeId.setPosition(i);
+            final Calendar date = Calendar.getInstance();
+            try {
+                date.setTime(sdf.parse(d.readText().toString()));
+            } catch (Exception ex) {
+                throw new RuntimeException(ex);
+            }
+            final String prefix = "parquet/event/year="+date.get(Calendar.YEAR)+"/month="+(date.get(Calendar.MONTH)+1)+"/day="+date.get(Calendar.DAY_OF_MONTH)+"/type_id="+typeId.readInteger();
+            //logger.debug("listing " + prefix);
 
-            /**
-             * TODO: For each partition in the request, create 1 or more splits. Splits
-             *   are parallelizable units of work. Each represents a part of your table
-             *   that needs to be read for the query. Splits are opaque to Athena aside from the
-             *   spill location and encryption key. All properties added to a split are solely
-             *   for your use when Athena calls your readWithContraints(...) function to perform
-             *   the read. In this example we just need to know the partition details (year, month, day).
-             *
-             Split split = Split.newBuilder(makeSpillLocation(request), makeEncryptionKey())
-             .add("year", String.valueOf(year.readInteger()))
-             .add("month", String.valueOf(month.readInteger()))
-             .add("day", String.valueOf(day.readInteger()))
-             .build();
+            ListObjectsV2Result result = amazonS3.listObjectsV2(
+                    new ListObjectsV2Request()
+                        .withBucketName("reveal-spark")
+                        .withPrefix(prefix)
+            );
 
-             splits.add(split);
-             *
-             */
+            while (true) {
+                logger.debug("testing " + result.getObjectSummaries().size() + " keys");
+                for (S3ObjectSummary obj : result.getObjectSummaries()) {
+                    final Matcher matcher = PATH_PATTERN.matcher(obj.getKey());
+                    if (matcher.matches()) {
+                        for (GeohashRange range : ranges) {
+                            if (range.overlaps(matcher.group(1), matcher.group(2))) {
+                                //logger.debug("accepting s3://" + obj.getBucketName() + "/" + obj.getKey() + " against " + range.getLower() + "-" + range.getUpper());
+                                accepted.add("s3://" + obj.getBucketName() + "/" + obj.getKey());
+                                break;
+                            }
+                        }
+                    } else {
+                        accepted.add("s3://" + obj.getBucketName() + "/" + obj.getKey());
+                    }
+                }
+                if (result.getNextContinuationToken() == null) {
+                    break;
+                }
+                result = amazonS3.listObjectsV2(
+                        new ListObjectsV2Request()
+                                .withContinuationToken(result.getNextContinuationToken())
+                                .withBucketName("reveal-spark")
+                                .withPrefix(prefix)
+                );
+            }
+
+            for (int s = 0; s < accepted.size(); s += maxSplitSize) {
+                splits.add(
+                        Split.newBuilder(makeSpillLocation(request), makeEncryptionKey())
+                                .add("d", d.readText().toString())
+                                .add("type_id", String.valueOf(typeId.readInteger()))
+                                .add("paths", String.join(",", accepted.subList(s, Math.min(accepted.size(), s+maxSplitSize))))
+                                .build()
+                );
+            }
         }
 
         logger.info("doGetSplits: exit - " + splits.size());
         return new GetSplitsResponse(catalogName, splits);
+    }
+
+    static GeohashTrie convertWKT(final String wkt) {
+        final GeohashTrie trie = new GeohashTrie();
+        final ShapeCoverage coverage = new ShapeCoverage();
+        final Geometry geom = OGCGeometry.fromText(wkt).getEsriGeometry();
+        final Envelope envel = new Envelope();
+        geom.queryEnvelope(envel);
+        coverage.cover(geom, envel, 9, trie, 0);
+        return trie;
     }
 }
