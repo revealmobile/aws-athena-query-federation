@@ -52,11 +52,11 @@ import org.apache.arrow.vector.types.pojo.ArrowType;
 import org.apache.arrow.vector.types.pojo.Field;
 import org.apache.arrow.vector.types.pojo.Schema;
 import org.apache.arrow.vector.util.Text;
-import org.apache.commons.codec.Charsets;
 import org.joda.time.DateTimeZone;
 
 import java.math.BigDecimal;
 import java.math.RoundingMode;
+import java.nio.charset.StandardCharsets;
 import java.time.Instant;
 import java.time.LocalDate;
 import java.time.LocalDateTime;
@@ -342,7 +342,7 @@ public class BlockUtils
                     }
                     else {
                         // always fall back to the object's toString()
-                        ((VarCharVector) vector).setSafe(pos, value.toString().getBytes(Charsets.UTF_8));
+                        ((VarCharVector) vector).setSafe(pos, value.toString().getBytes(StandardCharsets.UTF_8));
                     }
                     break;
                 case BIT:
@@ -832,7 +832,7 @@ public class BlockUtils
                     }
                     else {
                         // always fall back to the object's toString()
-                        byte[] bytes = value.toString().getBytes(Charsets.UTF_8);
+                        byte[] bytes = value.toString().getBytes(StandardCharsets.UTF_8);
                         try (ArrowBuf buf = allocator.buffer(bytes.length)) {
                             buf.writeBytes(bytes);
                             writer.varChar().writeVarChar(0, buf.readableBytes(), buf);
@@ -993,7 +993,7 @@ public class BlockUtils
                     break;
                 case VARCHAR:
                     if (value instanceof String) {
-                        byte[] bytes = ((String) value).getBytes(Charsets.UTF_8);
+                        byte[] bytes = ((String) value).getBytes(StandardCharsets.UTF_8);
                         try (ArrowBuf buf = allocator.buffer(bytes.length)) {
                             buf.writeBytes(bytes);
                             writer.varChar(field.getName()).writeVarChar(0, buf.readableBytes(), buf);
